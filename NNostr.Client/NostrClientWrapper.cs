@@ -30,7 +30,11 @@ public class NostrClientWrapper : IDisposable
 
     public bool IsExpired()
     {
-        return DateTimeOffset.UtcNow - _lastUsed > TimeSpan.FromMinutes(5);
+        // Only expire when nothing holds a lease: a long-lived consumer (eg. an NWC
+        // invoice listener) keeps UsageCount above zero without calling
+        // Increment/DecrementUsage again, and must not have its client disposed
+        // underneath it by the cleanup timer.
+        return UsageCount <= 0 && DateTimeOffset.UtcNow - _lastUsed > TimeSpan.FromMinutes(5);
     }
 
     public void Dispose()

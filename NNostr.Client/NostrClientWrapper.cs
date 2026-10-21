@@ -4,7 +4,7 @@ public class NostrClientWrapper : IDisposable
 {
     public INostrClient Client { get; private set; }
     internal int UsageCount = 0;
-    private bool _isDisposed = false;
+    private int _isDisposed;
     private DateTimeOffset _lastUsed;
 
     public NostrClientWrapper(INostrClient client)
@@ -39,10 +39,9 @@ public class NostrClientWrapper : IDisposable
 
     public void Dispose()
     {
-        if (!_isDisposed)
+        if (Interlocked.Exchange(ref _isDisposed, 1) == 0)
         {
             Client.Dispose();
-            _isDisposed = true;
         }
     }
 }

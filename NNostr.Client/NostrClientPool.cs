@@ -6,6 +6,11 @@ public class NostrClientPool : IDisposable
 {
     private readonly ConcurrentDictionary<string, NostrClientWrapper> _clientPool = new();
 
+    // Serializes acquisition (lookup + lease increment) against removal and
+    // disposal (expiration cleanup and KillClient), so a wrapper can never be
+    // disposed after a concurrent caller has acquired it.
+    private readonly object _poolLock = new();
+
     private Timer? _cleanupTimer;
     private readonly TimeSpan _unusedClientTimeout;
 
@@ -28,12 +33,21 @@ public class NostrClientPool : IDisposable
 
         var connString = GetConnString(relays);
 
-        var clientWrapper = _clientPool.GetOrAdd(connString,
-            k => new NostrClientWrapper(relays.Length > 1
-                ? new CompositeNostrClient(relays)
-                : new NostrClient(relays[0])));
+        NostrClientWrapper clientWrapper;
+        lock (_poolLock)
+        {
+            // Lookup and lease increment must be atomic with respect to
+            // CleanupExpiredClients and KillClient: otherwise the timer could
+            // observe an expired wrapper, then acquire the lock after our lookup
+            // but before our increment, and remove and dispose the very wrapper
+            // we are about to return.
+            clientWrapper = _clientPool.GetOrAdd(connString,
+                k => new NostrClientWrapper(relays.Length > 1
+                    ? new CompositeNostrClient(relays)
+                    : new NostrClient(relays[0])));
 
-        clientWrapper.IncrementUsage();
+            clientWrapper.IncrementUsage();
+        }
 
         return (clientWrapper.Client, new UsageDisposable(clientWrapper));
     }
@@ -62,9 +76,12 @@ public class NostrClientPool : IDisposable
     public void KillClient(Uri[] relays)
     {
         var connstring = GetConnString(relays);
-        if (_clientPool.TryRemove(connstring, out var clientWrapper))
+        lock (_poolLock)
         {
-            clientWrapper.Dispose();
+            if (_clientPool.TryRemove(connstring, out var clientWrapper))
+            {
+                clientWrapper.Dispose();
+            }
         }
     }
 
@@ -72,9 +89,14 @@ public class NostrClientPool : IDisposable
     {
         foreach (var key in _clientPool.Keys)
         {
-            if (_clientPool[key].IsExpired())
+            lock (_poolLock)
             {
-                if (_clientPool.TryRemove(key, out var clientWrapper))
+                // Re-check under the lock: the entry may have been acquired or
+                // removed since the key was enumerated.
+                if (!_clientPool.TryGetValue(key, out var clientWrapper) || !clientWrapper.IsExpired())
+                    continue;
+
+                if (_clientPool.TryRemove(key, out clientWrapper))
                 {
                     clientWrapper.Dispose();
                 }
@@ -100,9 +122,12 @@ public class NostrClientPool : IDisposable
     public void Dispose()
     {
         _cleanupTimer?.Dispose();
-        foreach (var client in _clientPool.Values)
+        lock (_poolLock)
         {
-            client.Dispose();
+            foreach (var client in _clientPool.Values)
+            {
+                client.Dispose();
+            }
         }
     }
 }
